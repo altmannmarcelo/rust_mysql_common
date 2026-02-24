@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::io::{self};
+use std::{borrow::Cow, io};
 
 use crate::io::ParseBuf;
 
@@ -30,10 +30,6 @@ pub fn lenenc_str_len(s: &[u8]) -> u64 {
     let len = s.len() as u64;
     lenenc_int_len(len) + len
 }
-
-// ---------------------------------------------------------------------------
-// Variable-length integer encoding (MySQL serialization library format)
-// ---------------------------------------------------------------------------
 
 /// Reads a variable-length unsigned integer from the MySQL serialization format.
 ///
@@ -136,6 +132,119 @@ pub fn varlen_uint_size(value: u64) -> usize {
         50..=56 => 8,
         _ => 9,
     }
+}
+
+/// Computes the self-inclusive payload size for the MySQL serialization
+/// library envelope.
+///
+/// In MySQL's format, `payload_size` covers all bytes of the serialized event
+/// data: the `extra_overhead` bytes that precede `payload_size` on the wire
+/// (e.g. the serialization version byte), the varlen encoding of
+/// `payload_size` itself, the varlen encoding of `last_non_ignorable_field_id`,
+/// and the raw field bytes.  Since `payload_size` appears in its own
+/// definition, this function iterates until the value stabilises (at most 2
+/// iterations).
+pub(crate) fn compute_self_inclusive_payload_size(
+    extra_overhead: usize,
+    fields_size: usize,
+    lnif: u64,
+) -> usize {
+    let fixed = extra_overhead + varlen_uint_size(lnif) + fields_size;
+    // Seed with fields_size as a lower-bound proxy for payload_size when
+    // computing the varlen encoding size of payload_size.
+    let mut ps = fixed + varlen_uint_size(fields_size as u64);
+    loop {
+        let next = fixed + varlen_uint_size(ps as u64);
+        if next == ps {
+            return ps;
+        }
+        ps = next;
+    }
+}
+
+/// Reads a variable-length signed integer from the MySQL serialization format.
+///
+/// Signed integers use zig-zag encoding: positive `x` is stored as `x << 1`,
+/// negative `x` is stored as `(-(x+1)) << 1 | 1`. The LSB is the sign bit.
+///
+/// Mirrors `read_varlen_bytes_signed()` from MySQL:
+/// <https://github.com/mysql/mysql-server/blob/trunk/libs/mysql/serialization/variable_length_integers.h>
+pub(crate) fn read_varlen_int(buf: &mut ParseBuf<'_>) -> io::Result<i64> {
+    let unsigned = read_varlen_uint(buf)?;
+    let sign = unsigned & 1;
+    let magnitude = (unsigned >> 1) as i64;
+    if sign != 0 {
+        // Use -magnitude - 1 instead of -(magnitude + 1) to avoid
+        // overflow when magnitude == i64::MAX (decoding i64::MIN).
+        Ok(-magnitude - 1)
+    } else {
+        Ok(magnitude)
+    }
+}
+
+/// Writes a variable-length signed integer in the MySQL serialization format.
+///
+/// Uses zig-zag encoding: positive `x` → `x << 1`, negative `x` → `(-(x+1)) << 1 | 1`.
+///
+/// Mirrors `write_varlen_bytes_signed()` from MySQL:
+/// <https://github.com/mysql/mysql-server/blob/trunk/libs/mysql/serialization/variable_length_integers.h>
+pub(crate) fn write_varlen_int(buf: &mut Vec<u8>, value: i64) {
+    let unsigned = if value >= 0 {
+        (value as u64) << 1
+    } else {
+        ((-(value + 1)) as u64) << 1 | 1
+    };
+    write_varlen_uint(buf, unsigned);
+}
+
+/// Reads a UUID encoded as 16 sequential varlen uint8 values.
+///
+/// In the MySQL serialization library, `Uuid` is a fixed-size container
+/// (`std::array<unsigned char, 16>`). Each byte is varlen-encoded individually
+/// without field IDs or a nested message envelope.
+pub(crate) fn read_serialized_uuid(buf: &mut ParseBuf<'_>) -> io::Result<[u8; 16]> {
+    let mut uuid = [0u8; 16];
+    for (i, byte) in uuid.iter_mut().enumerate() {
+        let val = read_varlen_uint(buf)?;
+        if val > u8::MAX as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("UUID byte {} out of range: {}", i, val),
+            ));
+        }
+        *byte = val as u8;
+    }
+    Ok(uuid)
+}
+
+/// Writes a UUID as 16 sequential varlen uint8 values.
+pub(crate) fn write_serialized_uuid(buf: &mut Vec<u8>, uuid: &[u8; 16]) {
+    for &byte in uuid.iter() {
+        write_varlen_uint(buf, byte as u64);
+    }
+}
+
+/// Reads a length-prefixed string from the MySQL serialization format.
+pub(crate) fn read_varlen_string<'a>(buf: &mut ParseBuf<'a>) -> io::Result<Cow<'a, str>> {
+    let raw_len = read_varlen_uint(buf)?;
+    let len: usize = raw_len.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("varlen string length {} exceeds platform usize", raw_len),
+        )
+    })?;
+
+    let bytes = buf.checked_eat(len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected end of buffer reading varlen string",
+        )
+    })?;
+
+    let s = std::str::from_utf8(bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8: {}", e)))?;
+
+    Ok(Cow::Borrowed(s))
 }
 
 pub(crate) fn unexpected_buf_eof() -> io::Error {

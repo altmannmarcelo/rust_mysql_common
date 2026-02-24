@@ -27,7 +27,7 @@
 //! * Gtid_event class reference:
 //!   <https://dev.mysql.com/doc/dev/mysql-server/latest/classmysql_1_1binlog_1_1event_1_1Gtid__event.html>
 
-use std::{borrow::Cow, cmp::min, io};
+use std::{cmp::min, io};
 
 use saturating::Saturating as S;
 
@@ -38,8 +38,9 @@ use crate::{
     },
     io::ParseBuf,
     misc::{
-        raw::{RawConst, RawFlags, int::*},
-        read_varlen_uint, varlen_uint_size, write_varlen_uint,
+        compute_self_inclusive_payload_size, raw::{RawConst, RawFlags, int::*},
+        read_serialized_uuid, read_varlen_int, read_varlen_string, read_varlen_uint,
+        varlen_uint_size, write_serialized_uuid, write_varlen_int, write_varlen_uint,
     },
     packets::Tag,
     proto::{MyDeserialize, MySerialize},
@@ -377,130 +378,6 @@ impl GtidEvent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Variable-length integer encoding (MySQL serialization library format)
-// ---------------------------------------------------------------------------
-
-/// Computes the self-inclusive payload size for the MySQL serialization
-/// library envelope.
-///
-/// In MySQL's format, `payload_size` covers all bytes of the serialized event
-/// data: the `extra_overhead` bytes that precede `payload_size` on the wire
-/// (e.g. the serialization version byte), the varlen encoding of
-/// `payload_size` itself, the varlen encoding of `last_non_ignorable_field_id`,
-/// and the raw field bytes.  Since `payload_size` appears in its own
-/// definition, this function iterates until the value stabilises (at most 2
-/// iterations).
-fn compute_self_inclusive_payload_size(
-    extra_overhead: usize,
-    fields_size: usize,
-    lnif: u64,
-) -> u64 {
-    let fixed = extra_overhead as u64 + varlen_uint_size(lnif) as u64 + fields_size as u64;
-    // Seed with fields_size as a lower-bound proxy for payload_size when
-    // computing the varlen encoding size of payload_size.
-    let mut ps = fixed + varlen_uint_size(fields_size as u64) as u64;
-    loop {
-        let next = fixed + varlen_uint_size(ps) as u64;
-        if next == ps {
-            return ps;
-        }
-        ps = next;
-    }
-}
-
-/// Reads a variable-length signed integer from the MySQL serialization format.
-///
-/// Signed integers use zig-zag encoding: positive `x` is stored as `x << 1`,
-/// negative `x` is stored as `(-(x+1)) << 1 | 1`. The LSB is the sign bit.
-///
-/// Mirrors `read_varlen_bytes_signed()` from MySQL:
-/// <https://github.com/mysql/mysql-server/blob/trunk/libs/mysql/serialization/variable_length_integers.h>
-fn read_varlen_int(buf: &mut ParseBuf<'_>) -> io::Result<i64> {
-    let unsigned = read_varlen_uint(buf)?;
-    let sign = unsigned & 1;
-    let magnitude = (unsigned >> 1) as i64;
-    if sign != 0 {
-        // Use -magnitude - 1 instead of -(magnitude + 1) to avoid
-        // overflow when magnitude == i64::MAX (decoding i64::MIN).
-        Ok(-magnitude - 1)
-    } else {
-        Ok(magnitude)
-    }
-}
-
-/// Writes a variable-length signed integer in the MySQL serialization format.
-///
-/// Uses zig-zag encoding: positive `x` → `x << 1`, negative `x` → `(-(x+1)) << 1 | 1`.
-///
-/// Mirrors `write_varlen_bytes_signed()` from MySQL:
-/// <https://github.com/mysql/mysql-server/blob/trunk/libs/mysql/serialization/variable_length_integers.h>
-fn write_varlen_int(buf: &mut Vec<u8>, value: i64) {
-    let unsigned = if value >= 0 {
-        (value as u64) << 1
-    } else {
-        ((-(value + 1)) as u64) << 1 | 1
-    };
-    write_varlen_uint(buf, unsigned);
-}
-
-/// Reads a UUID encoded as 16 sequential varlen uint8 values.
-///
-/// In the MySQL serialization library, `Uuid` is a fixed-size container
-/// (`std::array<unsigned char, 16>`). Each byte is varlen-encoded individually
-/// without field IDs or a nested message envelope.
-fn read_serialized_uuid(buf: &mut ParseBuf<'_>) -> io::Result<[u8; 16]> {
-    let mut uuid = [0u8; 16];
-    for (i, byte) in uuid.iter_mut().enumerate() {
-        let val = read_varlen_uint(buf)?;
-        if val > u8::MAX as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("UUID byte {} out of range: {}", i, val),
-            ));
-        }
-        *byte = val as u8;
-    }
-    Ok(uuid)
-}
-
-/// Writes a UUID as 16 sequential varlen uint8 values.
-fn write_serialized_uuid(buf: &mut Vec<u8>, uuid: &[u8; 16]) {
-    for &byte in uuid.iter() {
-        write_varlen_uint(buf, byte as u64);
-    }
-}
-
-/// Reads a length-prefixed string from the MySQL serialization format.
-fn read_varlen_string<'a>(buf: &mut ParseBuf<'a>) -> io::Result<Cow<'a, str>> {
-    let raw_len = read_varlen_uint(buf)?;
-    let len: usize = raw_len.try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("varlen string length {} exceeds platform usize", raw_len),
-        )
-    })?;
-
-    if buf.len() < len {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of buffer reading varlen string",
-        ));
-    }
-
-    let bytes = &buf.0[..len];
-    buf.0 = &buf.0[len..];
-
-    let s = std::str::from_utf8(bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8: {}", e)))?;
-
-    Ok(Cow::Borrowed(s))
-}
-
-// ---------------------------------------------------------------------------
-// MyDeserialize — dispatches based on event type in BinlogCtx
-// ---------------------------------------------------------------------------
-
 impl<'de> MyDeserialize<'de> for GtidEvent {
     const SIZE: Option<usize> = None;
     type Ctx = BinlogCtx<'de>;
@@ -518,10 +395,6 @@ impl<'de> MyDeserialize<'de> for GtidEvent {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Deserialization helpers
-// ---------------------------------------------------------------------------
 
 impl GtidEvent {
     /// Deserializes a `GTID_EVENT` / `ANONYMOUS_GTID_EVENT`
@@ -597,14 +470,12 @@ impl GtidEvent {
     /// Deserializes a `GTID_TAGGED_LOG_EVENT`
     /// (MySQL serialization library format, MySQL 8.4+).
     fn deserialize_tagged(buf: &mut ParseBuf<'_>) -> io::Result<Self> {
-        if buf.is_empty() {
-            return Err(io::Error::new(
+        let serialization_version = buf.checked_eat_u8().ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected end reading serialization version",
-            ));
-        }
-        let serialization_version = buf.0[0];
-        buf.0 = &buf.0[1..];
+            )
+        })?;
 
         match serialization_version {
             Self::TAGGED_SERIALIZATION_VERSION_V2 => {
@@ -658,8 +529,7 @@ impl GtidEvent {
                 ),
             ));
         }
-        let mut payload_buf = ParseBuf(&buf.0[..fields_len]);
-        buf.0 = &buf.0[fields_len..];
+        let mut payload_buf = buf.eat_buf(fields_len);
 
         // Initialize fields with defaults
         let mut flags = RawFlags::new(0);
@@ -826,10 +696,6 @@ impl GtidEvent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MySerialize — dispatches between untagged and tagged wire formats
-// ---------------------------------------------------------------------------
-
 impl MySerialize for GtidEvent {
     fn serialize(&self, buf: &mut Vec<u8>) {
         if self.tag.is_some() {
@@ -979,20 +845,16 @@ impl GtidEvent {
 
         // Write envelope
         buf.reserve(
-            1 + varlen_uint_size(payload_size)
+            1 + varlen_uint_size(payload_size as u64)
                 + varlen_uint_size(last_non_ignorable_field_id)
                 + fields.len(),
         );
         buf.push(self.serialization_version);
-        write_varlen_uint(buf, payload_size);
+        write_varlen_uint(buf, payload_size as u64);
         write_varlen_uint(buf, last_non_ignorable_field_id);
         buf.extend_from_slice(&fields);
     }
 }
-
-// ---------------------------------------------------------------------------
-// BinlogStruct / BinlogEvent
-// ---------------------------------------------------------------------------
 
 impl<'a> BinlogStruct<'a> for GtidEvent {
     fn len(&self, _version: BinlogVersion) -> usize {
@@ -1052,7 +914,7 @@ impl GtidEvent {
             version_byte_size,
             fields.len(),
             last_non_ignorable_field_id,
-        ) as usize;
+        );
 
         min(total_size, u32::MAX as usize - BinlogEventHeader::LEN)
     }
@@ -1068,10 +930,6 @@ impl<'a> BinlogEvent<'a> for GtidEvent {
     /// For the per-instance event type use [`GtidEvent::event_type()`].
     const EVENT_TYPE: EventType = EventType::GTID_EVENT;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1398,7 +1256,7 @@ mod tests {
 
         let mut buf = Vec::new();
         buf.push(version_byte); // serialization_version
-        write_varlen_uint(&mut buf, payload_size);
+        write_varlen_uint(&mut buf, payload_size as u64);
         write_varlen_uint(&mut buf, last_non_ignorable);
         buf.extend_from_slice(&fields);
         buf
